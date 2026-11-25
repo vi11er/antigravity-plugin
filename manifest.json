@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-antigravity",
+  "name": "Antigravity Assistant & Calendar",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Правая панель с часами, компактным календарём заметок (созданные/изменённые), быстрым превью и чатом Antigravity.",
+  "author": "Antigravity",
+  "isDesktopOnly": true
+}

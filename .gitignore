@@ -1,0 +1,18 @@
+# Secrets & local runtime state (NEVER commit!)
+backend/local_settings.json
+backend/usage_stats.json
+backend/.env
+*.key
+
+# Python virtual environment & caches
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS & editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
