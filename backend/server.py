@@ -268,7 +268,26 @@ async def list_models(payload: ModelsPayload | None = None) -> dict[str, Any]:
     return {"source": "agy_cli", "models": models}
 
 
-def format_prompt_with_context(payload: ChatPayload, is_first_turn: bool) -> str:
+def get_vault_file_tree_summary(vault_path: str, max_files: int = 250) -> str:
+    root = Path(vault_path)
+    if not root.exists():
+        return ""
+    files: list[str] = []
+    for md in root.rglob("*.md"):
+        rel_parts = md.relative_to(root).parts
+        if any(p.startswith(".") for p in rel_parts):
+            continue
+        files.append(md.relative_to(root).as_posix())
+        if len(files) >= max_files:
+            break
+    files.sort()
+    if not files:
+        return ""
+    header = f"Список заметок в Vault ({len(files)} шт.):\n"
+    return header + "\n".join(f"- {f}" for f in files)
+
+
+def format_prompt_with_context(payload: ChatPayload, is_first_turn: bool, vault_path: str) -> str:
     parts: list[str] = []
     if is_first_turn:
         parts.append(
@@ -276,6 +295,9 @@ def format_prompt_with_context(payload: ChatPayload, is_first_turn: bool) -> str
             "Отвечай кратко, по-русски, используя чистый Markdown и внутренние ссылки Obsidian [[Название заметки]]. "
             "Работай строго с заметками внутри текущей папки Vault. Не трогай скрытую папку .obsidian/."
         )
+        tree_summary = get_vault_file_tree_summary(vault_path)
+        if tree_summary:
+            parts.append("<vault_files>\n" + tree_summary + "\n</vault_files>")
 
     ctx_blocks: list[str] = []
     if payload.active_note_path:
@@ -331,7 +353,7 @@ async def chat_stream(payload: ChatPayload) -> StreamingResponse:
 
         async with session_mgr._lock:
             is_first = session_mgr.conversation_id is None
-            full_prompt = format_prompt_with_context(payload, is_first_turn=is_first)
+            full_prompt = format_prompt_with_context(payload, is_first_turn=is_first, vault_path=vault_path)
 
             cmd = [
                 agy_bin,
@@ -340,7 +362,8 @@ async def chat_stream(payload: ChatPayload) -> StreamingResponse:
                 "--output-format",
                 "stream-json",
                 "--mode",
-                "accept-edits",
+                "auto",
+                "--sandbox",
                 "--model",
                 model,
             ]
