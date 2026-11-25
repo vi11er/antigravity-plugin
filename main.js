@@ -28,11 +28,13 @@ const MONTHS_SHORT_RU = [
 const DAYS_SHORT_RU = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
 
 const DEFAULT_MODELS = [
-  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (Быстрая, высокий лимит)' },
-  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash (Стабильная, высокий лимит)' },
-  { id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash-Lite' },
-  { id: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Free Tier: 20 зап/день)' },
-  { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite' },
+  { id: 'gemini-4-hydrogen-low', label: 'Gemini 4 Hydrogen (Low)' },
+  { id: 'gemini-4-hydrogen-medium', label: 'Gemini 4 Hydrogen (Medium)' },
+  { id: 'gemini-4-argon-low', label: 'Gemini 4 Argon (Low)' },
+  { id: 'gemini-4-carbon-low', label: 'Gemini 4 Carbon (Low)' },
+  { id: 'gemini-4-neon-low', label: 'Gemini 4 Neon (Low)' },
+  { id: 'gemini-3.8-flash-low', label: 'Gemini 3.8 Flash (Low)' },
+  { id: 'gemini-3.8-flash-medium', label: 'Gemini 3.8 Flash (Medium)' },
 ];
 
 function detectDefaultUvPath() {
@@ -46,7 +48,7 @@ const DEFAULT_SETTINGS = {
   uvPath: detectDefaultUvPath(),
   backendDir: path.join(os.homedir(), '.gemini', 'antigravity', 'scratch', 'obsidian-antigravity', 'backend'),
   apiKey: '',
-  model: 'gemini-3.6-flash',
+  model: 'gemini-4-hydrogen-low',
   autoStartBackend: true,
   excludeFreshCreateFromModified: true,
   includeActiveNote: true,
@@ -110,14 +112,13 @@ class ApiKeyModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h3', { text: 'Настройка Antigravity SDK' });
+    contentEl.createEl('h3', { text: 'Выбор модели Antigravity (Google Pro)' });
     contentEl.createEl('p', {
-      text: 'Укажите Gemini API Key (из Google AI Studio) для работы локального агента Antigravity в вашем Vault.',
+      text: 'Подключено через локальный Antigravity CLI (agy) с вашей подпиской Google AI Pro — API-ключ Google AI Studio не требуется.',
       cls: 'setting-item-description',
     });
 
-    let keyValue = this.plugin.settings.apiKey || '';
-    let modelValue = this.plugin.settings.model || 'gemini-4-hydrogen';
+    let modelValue = this.plugin.settings.model || 'gemini-4-hydrogen-low';
     let modelDropdown = null;
 
     const populateDropdown = (modelsList) => {
@@ -136,22 +137,8 @@ class ApiKeyModal extends Modal {
     };
 
     new Setting(contentEl)
-      .setName('Gemini API Key')
-      .setDesc('Ключ сохраняется локально на вашем компьютере')
-      .addText((text) => {
-        text.inputEl.type = 'password';
-        text.inputEl.style.width = '260px';
-        text
-          .setPlaceholder('AIzaSy...')
-          .setValue(keyValue)
-          .onChange((v) => {
-            keyValue = v.trim();
-          });
-      });
-
-    new Setting(contentEl)
       .setName('Модель Antigravity')
-      .setDesc('Список моделей из Antigravity SDK и вашего API-ключа')
+      .setDesc('Доступные модели вашей подписки Antigravity / Google Pro')
       .addDropdown((dd) => {
         modelDropdown = dd;
         populateDropdown(DEFAULT_MODELS);
@@ -164,27 +151,26 @@ class ApiKeyModal extends Modal {
           .setIcon('refresh-cw')
           .setTooltip('Обновить список доступных моделей')
           .onClick(async () => {
-            const models = await this.plugin.fetchAvailableModels(keyValue);
+            const models = await this.plugin.fetchAvailableModels('', true);
             populateDropdown(models);
             new Notice(`Загружено моделей: ${models.length}`);
           })
       );
 
-    this.plugin.fetchAvailableModels(keyValue).then((models) => {
+    this.plugin.fetchAvailableModels('', false).then((models) => {
       populateDropdown(models);
     });
 
     new Setting(contentEl)
       .addButton((btn) =>
         btn
-          .setButtonText('Сохранить и подключить')
+          .setButtonText('Сохранить')
           .setCta()
           .onClick(async () => {
-            this.plugin.settings.apiKey = keyValue;
             this.plugin.settings.model = modelValue;
             await this.plugin.saveSettings();
             await this.plugin.pushBackendConfig();
-            new Notice('Настройки Antigravity сохранены');
+            new Notice(`Выбрана модель: ${modelValue}`);
             if (this.onSaved) this.onSaved();
             this.close();
           })
@@ -298,7 +284,7 @@ class AntigravityAssistantView extends ItemView {
     const headerActions = chatHeader.createDiv({ cls: 'ag-chat-header-actions' });
     this.tokenPillEl = headerActions.createSpan({ cls: 'ag-token-pill', text: '100%' });
     this.tokenPillEl.title = 'Остаток контекста сессии: 100%';
-    const keyBtn = headerActions.createEl('button', { cls: 'ag-icon-btn', text: 'Ключ API' });
+    const keyBtn = headerActions.createEl('button', { cls: 'ag-icon-btn', text: 'Модель' });
     keyBtn.addEventListener('click', () => {
       new ApiKeyModal(this.app, this.plugin, () => this.checkBackendHealth()).open();
     });
@@ -1061,12 +1047,12 @@ module.exports = class ObsidianAntigravityPlugin extends Plugin {
     }
   }
 
-  async fetchAvailableModels(apiKey) {
+  async fetchAvailableModels(apiKey, force = false) {
     try {
       const res = await fetch(`http://127.0.0.1:${this.settings.port}/models`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: apiKey || this.settings.apiKey || '' }),
+        body: JSON.stringify({ api_key: apiKey || this.settings.apiKey || '', force: Boolean(force) }),
       });
       if (res.ok) {
         const data = await res.json();

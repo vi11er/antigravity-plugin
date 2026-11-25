@@ -6,30 +6,15 @@ import json
 import logging
 import os
 import shutil
+import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
-import google.antigravity as ag
-from google.antigravity import (
-    Agent,
-    AgentBehavior,
-    BuiltinTools,
-    CapabilitiesConfig,
-    CustomSystemInstructions,
-    GeminiAPIEndpoint,
-    GeminiModelOptions,
-    LocalAgentConfig,
-    ModelTarget,
-    ThinkingLevel,
-)
-from google.antigravity.hooks import policy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("obsidian-antigravity")
@@ -37,32 +22,46 @@ logger = logging.getLogger("obsidian-antigravity")
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "local_settings.json"
 USAGE_PATH = BASE_DIR / "usage_stats.json"
-DEFAULT_VAULT = ""
-DEFAULT_MODEL = "gemini-3.6-flash"
+DEFAULT_MODEL = "gemini-4-hydrogen-low"
 DEFAULT_CONTEXT_LIMIT = 1_048_576
-FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite")
 
-ANTIGRAVITY_MODELS: list[dict[str, str]] = [
-    {"id": "gemini-3.6-flash", "label": "Gemini 3.6 Flash (Быстрая, высокий лимит)"},
-    {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash (Стабильная, высокий лимит)"},
-    {"id": "gemini-3.5-flash-lite", "label": "Gemini 3.5 Flash-Lite"},
-    {"id": "gemini-4-hydrogen", "label": "Gemini 4 Hydrogen (Лимит Free Tier: 20 зап/день)"},
-    {"id": "gemini-3.1-flash-lite", "label": "Gemini 3.1 Flash-Lite"},
+FALLBACK_MODELS: list[dict[str, str]] = [
+    {"id": "gemini-4-hydrogen-low", "label": "Gemini 4 Hydrogen (Low — быстрая)"},
+    {"id": "gemini-4-hydrogen-medium", "label": "Gemini 4 Hydrogen (Medium)"},
+    {"id": "gemini-4-argon-low", "label": "Gemini 4 Argon (Low)"},
+    {"id": "gemini-4-carbon-low", "label": "Gemini 4 Carbon (Low)"},
+    {"id": "gemini-4-neon-low", "label": "Gemini 4 Neon (Low)"},
+    {"id": "gemini-3.8-flash-low", "label": "Gemini 3.8 Flash (Low — сверхбыстрая)"},
+    {"id": "gemini-3.8-flash-medium", "label": "Gemini 3.8 Flash (Medium)"},
 ]
+
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def find_agy_binary() -> str:
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    if local_app:
+        candidate = Path(local_app) / "agy" / "bin" / "agy.exe"
+        if candidate.exists():
+            return str(candidate)
+    found = shutil.which("agy")
+    if found:
+        return found
+    return "agy"
 
 
 def load_local_settings() -> dict[str, Any]:
     data: dict[str, Any] = {
-        "vault_path": os.environ.get("OBSIDIAN_VAULT_PATH", DEFAULT_VAULT),
+        "vault_path": os.environ.get("OBSIDIAN_VAULT_PATH", ""),
         "model": os.environ.get("ANTIGRAVITY_MODEL", DEFAULT_MODEL),
-        "api_key": os.environ.get("GEMINI_API_KEY", ""),
     }
     if CONFIG_PATH.exists():
         try:
             saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            for k in ("vault_path", "model", "api_key"):
-                if saved.get(k):
-                    data[k] = saved[k]
+            if saved.get("vault_path"):
+                data["vault_path"] = saved["vault_path"]
+            if saved.get("model"):
+                data["model"] = saved["model"]
         except Exception as exc:
             logger.warning("Could not read local_settings.json: %s", exc)
     return data
@@ -75,109 +74,14 @@ def save_local_settings(settings: dict[str, Any]) -> None:
     )
 
 
-def resolve_vault_file(vault_root: Path, rel_or_abs: str) -> Path:
-    """Resolves a path strictly inside vault_root to prevent escaping the Vault."""
-    root = vault_root.resolve()
-    candidate = Path(rel_or_abs)
-    target = (candidate if candidate.is_absolute() else (root / candidate)).resolve()
-    if target != root and root not in target.parents:
-        raise ValueError(f"Доступ разрешён только внутри хранилища Obsidian: {root}")
-    return target
-
-
-def make_vault_tools(vault_root: Path) -> list[Any]:
-    """Creates Obsidian-specific file management tools bound to vault_root."""
-
-    def move_or_rename_note(source_path: str, destination_path: str) -> str:
-        """Перемещает или переименовывает заметку (.md) или папку внутри Obsidian Vault.
-
-        Args:
-            source_path: Относительный путь от корня Vault (например 'Без названия.md').
-            destination_path: Новый относительный путь от корня Vault (например 'Задачи/Новая заметка.md').
-        """
-        src = resolve_vault_file(vault_root, source_path)
-        dst = resolve_vault_file(vault_root, destination_path)
-        if not src.exists():
-            return f"Ошибка: исходный путь не найден: {source_path}"
-        if dst.exists():
-            return f"Ошибка: целевой файл уже существует: {destination_path}"
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dst))
-        return f"Успешно перемещено: '{src.relative_to(vault_root)}' -> '{dst.relative_to(vault_root)}'"
-
-    def move_note_to_trash(note_path: str) -> str:
-        """Безопасно удаляет заметку, перемещая её в корзину Obsidian (.trash/).
-
-        Args:
-            note_path: Относительный путь к заметке внутри Vault.
-        """
-        src = resolve_vault_file(vault_root, note_path)
-        if not src.exists():
-            return f"Ошибка: файл не найден: {note_path}"
-        trash_dir = vault_root / ".trash"
-        trash_dir.mkdir(parents=True, exist_ok=True)
-        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        dst = trash_dir / f"{src.stem}_{stamp}{src.suffix}"
-        shutil.move(str(src), str(dst))
-        return f"Заметка перемещена в корзину Obsidian (.trash/{dst.name})"
-
-    def list_vault_notes_by_date(date_iso: str) -> str:
-        """Возвращает список заметок (.md), созданных или изменённых в указанную дату YYYY-MM-DD.
-
-        Args:
-            date_iso: Дата в формате YYYY-MM-DD (например '2026-11-25').
-        """
-        target_date = dt.date.fromisoformat(date_iso)
-        created_list: list[str] = []
-        modified_list: list[str] = []
-        for md in vault_root.rglob("*.md"):
-            rel_parts = md.relative_to(vault_root).parts
-            if any(p.startswith(".") for p in rel_parts):
-                continue
-            stat = md.stat()
-            c_date = dt.datetime.fromtimestamp(stat.st_ctime).date()
-            m_date = dt.datetime.fromtimestamp(stat.st_mtime).date()
-            rel_str = md.relative_to(vault_root).as_posix()
-            if c_date == target_date:
-                created_list.append(rel_str)
-            if m_date == target_date and c_date != target_date:
-                modified_list.append(rel_str)
-        return json.dumps(
-            {
-                "date": date_iso,
-                "created": sorted(created_list),
-                "modified": sorted(modified_list),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    return [move_or_rename_note, move_note_to_trash, list_vault_notes_by_date]
-
-
-def build_system_instructions(vault_path: str) -> CustomSystemInstructions:
-    text = f"""Ты — встроенный ассистент Antigravity внутри правой боковой панели Obsidian.
-Твоя рабочая папка (Obsidian Vault): {vault_path}
-
-Правила работы:
-1. Отвечай кратко, по делу, на русском языке, используя чистый Markdown.
-2. При упоминании заметок используй внутренние ссылки Obsidian в формате [[Название заметки]] (или [[Путь/к/заметке|Название]]), чтобы пользователь мог кликнуть по ним прямо в чате.
-3. Ты можешь читать, создавать, редактировать, перемещать, переименовывать и сортировать заметки внутри Vault ({vault_path}).
-4. Для перемещения/переименования используй инструмент `move_or_rename_note`, для безопасного удаления — `move_note_to_trash` (перемещает в `.trash`). Никогда не трогай скрытую системную папку `.obsidian/`.
-5. КРИТИЧЕСКИ ЗАПРЕЩЕНО обращаться к файлам или изменять любые файлы за пределами папки Vault ({vault_path}), включая любые внешние репозитории (например raysharp_autotests) или внешние трекеры задач.
-"""
-    return CustomSystemInstructions(text=text)
-
-
-class AgentSessionManager:
+class AgyCliSessionManager:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._agent: Agent | None = None
-        self._active_signature: tuple[str, str, str] | None = None
-        self.active_response: Any = None
+        self.conversation_id: str | None = None
+        self.active_proc: asyncio.subprocess.Process | None = None
         self.session_used_tokens: int = 0
         self.model_context_limit: int = DEFAULT_CONTEXT_LIMIT
-        self._limit_cache: dict[str, int] = {}
+        self._cached_models: list[dict[str, str]] | None = None
 
     def _get_daily_usage(self) -> dict[str, Any]:
         today = dt.date.today().isoformat()
@@ -190,27 +94,23 @@ class AgentSessionManager:
                 pass
         return {"date": today, "tokens": 0}
 
-    def add_turn_usage(self, usage: Any) -> dict[str, Any]:
-        if usage is not None:
-            prompt_t = getattr(usage, "prompt_token_count", None) or 0
-            cand_t = getattr(usage, "candidates_token_count", None) or 0
-            thoughts_t = getattr(usage, "thoughts_token_count", None) or 0
-            total_t = getattr(usage, "total_token_count", None) or (prompt_t + cand_t + thoughts_t)
+    def record_usage(self, usage_dict: dict[str, Any] | None) -> dict[str, Any]:
+        if isinstance(usage_dict, dict):
+            inp = int(usage_dict.get("input_tokens") or 0)
+            out = int(usage_dict.get("output_tokens") or 0)
+            total = int(usage_dict.get("total_tokens") or (inp + out))
+            if inp + out > 0:
+                self.session_used_tokens = inp + out
+            elif total > 0:
+                self.session_used_tokens += total
 
-            # Context window occupancy is prompt + output of the latest turn
-            if prompt_t + cand_t > 0:
-                self.session_used_tokens = prompt_t + cand_t
-            elif total_t > 0:
-                self.session_used_tokens += total_t
-
-            if total_t > 0:
+            if total > 0:
                 daily = self._get_daily_usage()
-                daily["tokens"] = int(daily.get("tokens", 0)) + int(total_t)
+                daily["tokens"] = int(daily.get("tokens", 0)) + total
                 try:
                     USAGE_PATH.write_text(json.dumps(daily, ensure_ascii=False), encoding="utf-8")
                 except Exception:
                     pass
-
         return self.get_usage_summary()
 
     def get_usage_summary(self) -> dict[str, Any]:
@@ -226,109 +126,61 @@ class AgentSessionManager:
             "daily_tokens": int(daily.get("tokens", 0)),
         }
 
-    def _resolve_context_limit(self, model: str, api_key: str) -> int:
-        if model in self._limit_cache:
-            return self._limit_cache[model]
-        limit = DEFAULT_CONTEXT_LIMIT
-        if api_key:
+    async def cancel_active(self) -> None:
+        proc = self.active_proc
+        if proc is not None and proc.returncode is None:
             try:
-                from google import genai
-
-                client = genai.Client(api_key=api_key)
-                info = client.models.get(model=model)
-                inp_lim = getattr(info, "input_token_limit", None)
-                if isinstance(inp_lim, int) and inp_lim > 0:
-                    limit = inp_lim
+                proc.terminate()
             except Exception:
                 pass
-        self._limit_cache[model] = limit
-        return limit
 
-    async def stop(self) -> None:
-        if self._agent is not None:
-            try:
-                await self._agent.__aexit__(None, None, None)
-            except Exception as exc:
-                logger.warning("Error closing agent session: %s", exc)
-            finally:
-                self._agent = None
-                self._active_signature = None
+    async def reset(self) -> None:
+        await self.cancel_active()
+        self.conversation_id = None
         self.session_used_tokens = 0
 
-    async def ensure_agent(self, vault_path: str, model: str, api_key: str) -> Agent:
-        sig = (vault_path, model, api_key)
-        if self._agent is not None and self._active_signature == sig:
-            return self._agent
+    def fetch_models_sync(self, force: bool = False) -> list[dict[str, str]]:
+        if self._cached_models and not force:
+            return self._cached_models
+        agy_bin = find_agy_binary()
+        try:
+            res = subprocess.run(
+                [agy_bin, "models"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            models: list[dict[str, str]] = []
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if not line or "\t" not in line:
+                    continue
+                m_id, m_label = line.split("\t", 1)
+                m_id = m_id.strip()
+                m_label = m_label.strip()
+                if m_id and not m_id.startswith("gemini-pro-orchestrator"):
+                    models.append({"id": m_id, "label": m_label})
+            if models:
+                self._cached_models = models
+                return models
+        except Exception as exc:
+            logger.warning("Could not fetch agy models: %s", exc)
+        return FALLBACK_MODELS
 
-        await self.stop()
 
-        vault_root = Path(vault_path).resolve()
-        if not vault_root.exists():
-            raise ValueError(f"Папка Vault не найдена: {vault_path}")
-
-        def is_outside_vault(args: dict[str, Any]) -> bool:
-            for key in ("Path", "DirectoryPath", "SearchPath"):
-                val = args.get(key)
-                if isinstance(val, str) and val.strip():
-                    try:
-                        resolve_vault_file(vault_root, val)
-                    except ValueError:
-                        return True
-            return False
-
-        chosen_model = model or DEFAULT_MODEL
-        model_target = ModelTarget(
-            name=chosen_model,
-            endpoint=GeminiAPIEndpoint(
-                api_key=api_key,
-                options=GeminiModelOptions(thinking_level=ThinkingLevel.LOW),
-            ),
-        )
-        cfg = LocalAgentConfig(
-            api_key=api_key,
-            model=model_target,
-            workspaces=[str(vault_root)],
-            system_instructions=build_system_instructions(str(vault_root)),
-            tools=make_vault_tools(vault_root),
-            capabilities=CapabilitiesConfig(
-                agent_behavior=AgentBehavior.MINIMAL,
-                enable_subagents=False,
-                disabled_tools=[
-                    BuiltinTools.RUN_COMMAND,
-                    BuiltinTools.ASK_QUESTION,
-                    BuiltinTools.INVOKE_SUBAGENT,
-                    BuiltinTools.RUN_WORKFLOW,
-                    BuiltinTools.SCHEDULE,
-                    BuiltinTools.GENERATE_IMAGE,
-                ],
-            ),
-            policies=[
-                policy.deny(
-                    "*",
-                    when=is_outside_vault,
-                    reason="Доступ разрешён только к файлам внутри Obsidian Vault.",
-                ),
-                policy.allow_all(),
-            ],
-        )
-        agent = Agent(cfg)
-        await agent.__aenter__()
-        self._agent = agent
-        self._active_signature = sig
-        self.session_used_tokens = 0
-        self.model_context_limit = await asyncio.to_thread(self._resolve_context_limit, model or DEFAULT_MODEL, api_key)
-        logger.info("Started Antigravity Agent session for vault=%s model=%s limit=%s", vault_root, model, self.model_context_limit)
-        return agent
+session_mgr = AgyCliSessionManager()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     yield
-    await session_mgr.stop()
+    await session_mgr.cancel_active()
 
 
-session_mgr = AgentSessionManager()
-app = FastAPI(title="Obsidian Antigravity Backend", lifespan=lifespan)
+app = FastAPI(title="Obsidian Antigravity CLI Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -346,6 +198,7 @@ class ConfigPayload(BaseModel):
 
 class ModelsPayload(BaseModel):
     api_key: str | None = None
+    force: bool = False
 
 
 class ChatPayload(BaseModel):
@@ -362,13 +215,16 @@ class ChatPayload(BaseModel):
 @app.get("/health")
 async def health() -> dict[str, Any]:
     cfg = load_local_settings()
+    agy_bin = find_agy_binary()
     return {
         "status": "ok",
-        "sdk_version": getattr(ag, "__version__", "installed"),
-        "agent_started": session_mgr._agent is not None,
-        "has_api_key": bool(cfg.get("api_key")),
+        "engine": "agy_cli",
+        "agy_path": agy_bin,
+        "agy_found": Path(agy_bin).exists() or shutil.which(agy_bin) is not None,
+        "has_api_key": True,  # Authenticated via Antigravity CLI (Google AI Pro)
         "vault_path": cfg.get("vault_path"),
-        "model": cfg.get("model"),
+        "model": cfg.get("model") or DEFAULT_MODEL,
+        "conversation_id": session_mgr.conversation_id,
         "usage": session_mgr.get_usage_summary(),
     }
 
@@ -380,84 +236,47 @@ async def update_config(payload: ConfigPayload) -> dict[str, Any]:
         cfg["vault_path"] = payload.vault_path.strip()
     if payload.model is not None and payload.model.strip():
         cfg["model"] = payload.model.strip()
-    if payload.api_key is not None:
-        cfg["api_key"] = payload.api_key.strip()
     save_local_settings(cfg)
-    await session_mgr.stop()
-    return {"status": "saved", "has_api_key": bool(cfg.get("api_key")), "model": cfg.get("model")}
+    return {"status": "saved", "has_api_key": True, "model": cfg.get("model")}
 
 
 @app.post("/reset")
 async def reset_session() -> dict[str, Any]:
-    await session_mgr.stop()
+    await session_mgr.reset()
     return {"status": "reset", "usage": session_mgr.get_usage_summary()}
 
 
 @app.post("/shutdown")
 async def shutdown_server() -> dict[str, str]:
-    await session_mgr.stop()
+    await session_mgr.reset()
     loop = asyncio.get_running_loop()
     loop.call_later(0.15, lambda: os._exit(0))
     return {"status": "shutting_down"}
 
 
-def _fetch_live_gemini_models(api_key: str) -> list[dict[str, str]]:
-    from google import genai
-
-    client = genai.Client(api_key=api_key)
-    out: list[dict[str, str]] = []
-    for m in client.models.list():
-        name = getattr(m, "name", "") or ""
-        if name.startswith("models/"):
-            name = name[len("models/"):]
-        if not name.startswith("gemini-"):
-            continue
-        if any(skip in name for skip in ("-image", "embedding", "tts", "robotics", "live")):
-            continue
-        actions = getattr(m, "supported_actions", None) or []
-        if actions and "generateContent" not in actions:
-            continue
-        display = getattr(m, "display_name", None) or name
-        out.append({"id": name, "label": f"{display} ({name})" if display != name else name})
-    return out
+@app.post("/cancel")
+async def cancel_turn() -> dict[str, str]:
+    await session_mgr.cancel_active()
+    return {"status": "cancelled"}
 
 
 @app.post("/models")
 @app.get("/models")
 async def list_models(payload: ModelsPayload | None = None) -> dict[str, Any]:
-    cfg = load_local_settings()
-    api_key = ((payload.api_key if payload else None) or cfg.get("api_key") or "").strip()
-
-    merged: dict[str, str] = {m["id"]: m["label"] for m in ANTIGRAVITY_MODELS}
-    source = "sdk_builtin"
-    if api_key:
-        try:
-            live = await asyncio.wait_for(asyncio.to_thread(_fetch_live_gemini_models, api_key), timeout=6.0)
-            for m in live:
-                if m["id"] not in merged:
-                    merged[m["id"]] = m["label"]
-            source = "sdk_and_api"
-        except Exception as exc:
-            logger.warning("Could not fetch live Gemini models: %s", exc)
-
-    return {
-        "source": source,
-        "models": [{"id": k, "label": v} for k, v in merged.items()],
-    }
+    force = bool(payload.force) if payload else False
+    models = await asyncio.to_thread(session_mgr.fetch_models_sync, force)
+    return {"source": "agy_cli", "models": models}
 
 
-@app.post("/cancel")
-async def cancel_turn() -> dict[str, str]:
-    resp = session_mgr.active_response
-    if resp is not None:
-        try:
-            await resp.cancel()
-        except Exception as exc:
-            logger.warning("Cancel error: %s", exc)
-    return {"status": "cancelled"}
+def format_prompt_with_context(payload: ChatPayload, is_first_turn: bool) -> str:
+    parts: list[str] = []
+    if is_first_turn:
+        parts.append(
+            "Системная инструкция: ты встроенный ассистент внутри Obsidian. "
+            "Отвечай кратко, по-русски, используя чистый Markdown и внутренние ссылки Obsidian [[Название заметки]]. "
+            "Работай строго с заметками внутри текущей папки Vault. Не трогай скрытую папку .obsidian/."
+        )
 
-
-def format_prompt_with_context(payload: ChatPayload) -> str:
     ctx_blocks: list[str] = []
     if payload.active_note_path:
         note_info = f"Открытая заметка в редакторе: `{payload.active_note_path}`"
@@ -478,11 +297,11 @@ def format_prompt_with_context(payload: ChatPayload) -> str:
                 day_info += "\nЗаметок за этот день пока нет."
         ctx_blocks.append(day_info)
 
-    if not ctx_blocks:
-        return payload.message
+    if ctx_blocks:
+        parts.append("<obsidian_context>\n" + "\n\n".join(ctx_blocks) + "\n</obsidian_context>")
 
-    joined_ctx = "\n\n".join(ctx_blocks)
-    return f"<obsidian_context>\n{joined_ctx}\n</obsidian_context>\n\nЗапрос пользователя:\n{payload.message}"
+    parts.append("Запрос пользователя:\n" + payload.message)
+    return "\n\n".join(parts)
 
 
 def sse_event(data: dict[str, Any]) -> str:
@@ -493,96 +312,128 @@ def sse_event(data: dict[str, Any]) -> str:
 async def chat_stream(payload: ChatPayload) -> StreamingResponse:
     async def event_generator():
         cfg = load_local_settings()
-        api_key = (payload.api_key or cfg.get("api_key") or "").strip()
         model = (payload.model or cfg.get("model") or DEFAULT_MODEL).strip()
-        vault_path = (payload.vault_path or cfg.get("vault_path") or DEFAULT_VAULT).strip()
+        vault_path = (payload.vault_path or cfg.get("vault_path") or "").strip()
 
-        if payload.api_key and payload.api_key.strip() != cfg.get("api_key"):
-            cfg["api_key"] = api_key
-            cfg["model"] = model
-            cfg["vault_path"] = vault_path
-            save_local_settings(cfg)
+        if not vault_path or not Path(vault_path).exists():
+            yield sse_event({"type": "error", "message": f"Папка Vault не найдена: {vault_path}"})
+            return
 
-        if not api_key:
+        agy_bin = find_agy_binary()
+        if not (Path(agy_bin).exists() or shutil.which(agy_bin)):
             yield sse_event(
                 {
                     "type": "error",
-                    "code": "MISSING_API_KEY",
-                    "message": (
-                        "Не указан Gemini API Key для запуска Antigravity SDK.\n"
-                        "Откройте Settings → Antigravity Assistant & Calendar в Obsidian "
-                        "(или нажмите «Ключ API» в шапке чата) и вставьте ключ из Google AI Studio."
-                    ),
+                    "message": "Antigravity CLI (agy.exe) не найден. Установите его командой: irm https://antigravity.google/cli/install.ps1 | iex",
                 }
             )
             return
 
         async with session_mgr._lock:
-            full_prompt = format_prompt_with_context(payload)
-            candidate_models = [model] + [m for m in FALLBACK_MODELS if m != model]
-            last_error: Exception | None = None
+            is_first = session_mgr.conversation_id is None
+            full_prompt = format_prompt_with_context(payload, is_first_turn=is_first)
 
-            for attempt_idx, try_model in enumerate(candidate_models):
-                try:
-                    agent = await session_mgr.ensure_agent(vault_path, try_model, api_key)
-                    if attempt_idx > 0:
-                        cfg["model"] = try_model
-                        save_local_settings(cfg)
-                        yield sse_event(
-                            {
-                                "type": "tool_call",
-                                "name": f"Автопереключение на {try_model} (лимит/ошибка {model})",
-                                "args": {},
-                            }
-                        )
+            cmd = [
+                agy_bin,
+                "-p",
+                full_prompt,
+                "--output-format",
+                "stream-json",
+                "--mode",
+                "accept-edits",
+                "--model",
+                model,
+            ]
+            if session_mgr.conversation_id:
+                cmd.extend(["--conversation", session_mgr.conversation_id])
 
-                    response = await agent.chat(full_prompt)
-                    session_mgr.active_response = response
+            logger.info("Running agy CLI: model=%s conv=%s cwd=%s", model, session_mgr.conversation_id, vault_path)
 
-                    async for chunk in response.chunks:
-                        if isinstance(chunk, ag.types.Thought):
-                            if chunk.text:
-                                yield sse_event({"type": "thought", "text": chunk.text})
-                        elif isinstance(chunk, ag.types.ToolCall):
-                            yield sse_event(
-                                {
-                                    "type": "tool_call",
-                                    "name": chunk.name,
-                                    "args": chunk.args if isinstance(chunk.args, dict) else str(chunk.args),
-                                }
-                            )
-                        elif isinstance(chunk, ag.types.Text):
-                            if chunk.text:
-                                yield sse_event({"type": "token", "text": chunk.text})
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=vault_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            session_mgr.active_proc = proc
 
-                    usage_summary = session_mgr.add_turn_usage(getattr(response, "usage_metadata", None))
-                    yield sse_event({"type": "usage", "usage": usage_summary})
-                    yield sse_event({"type": "done"})
-                    last_error = None
-                    break
-                except asyncio.CancelledError:
-                    await session_mgr.stop()
-                    yield sse_event({"type": "done", "cancelled": True})
-                    last_error = None
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    err_str = str(exc)
-                    logger.warning("Attempt with model=%s failed: %s", try_model, err_str)
-                    # Always tear down broken/closed Agent session so next request never hangs
-                    await session_mgr.stop()
-                    # Retry with fallback model on WebSocket 1000 close, 429 quota, 404 or 503
-                    if any(
-                        marker in err_str
-                        for marker in ("1000 (OK)", "ConnectionClosed", "429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND", "503", "UNAVAILABLE")
-                    ):
+            seen_tool_steps: set[int] = set()
+            streamed_any_text = False
+            got_result = False
+
+            try:
+                assert proc.stdout is not None
+                while True:
+                    raw_line = await proc.stdout.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
                         continue
-                    break
-                finally:
-                    session_mgr.active_response = None
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
 
-            if last_error is not None:
-                yield sse_event({"type": "error", "message": str(last_error)})
+                    ev_type = evt.get("event")
+                    if ev_type == "init":
+                        cid = evt.get("conversation_id")
+                        if cid:
+                            session_mgr.conversation_id = cid
+                    elif ev_type == "step_update":
+                        su = evt.get("step_update") or {}
+                        cid = su.get("conversation_id")
+                        if cid:
+                            session_mgr.conversation_id = cid
+                        st = su.get("step_type")
+                        idx = su.get("step_index")
+                        if st == "tool":
+                            tname = su.get("tool_name")
+                            if tname and idx not in seen_tool_steps:
+                                seen_tool_steps.add(idx)
+                                yield sse_event({"type": "tool_call", "name": tname, "args": su.get("tool_info") or {}})
+                        elif st == "agent_response":
+                            delta = su.get("text_delta")
+                            if delta:
+                                streamed_any_text = True
+                                yield sse_event({"type": "token", "text": delta})
+                    elif ev_type == "result":
+                        got_result = True
+                        res = evt.get("result") or {}
+                        cid = res.get("conversation_id")
+                        if cid:
+                            session_mgr.conversation_id = cid
+                        status = res.get("status")
+                        if status != "SUCCESS" and res.get("error"):
+                            yield sse_event({"type": "error", "message": res["error"]})
+                        else:
+                            if not streamed_any_text and res.get("response"):
+                                streamed_any_text = True
+                                yield sse_event({"type": "token", "text": res["response"]})
+                            usage_summary = session_mgr.record_usage(res.get("usage"))
+                            yield sse_event({"type": "usage", "usage": usage_summary})
+                            yield sse_event({"type": "done"})
+
+                await proc.wait()
+
+                if not got_result:
+                    stderr_text = ""
+                    if proc.stderr:
+                        stderr_text = (await proc.stderr.read()).decode("utf-8", errors="replace").strip()
+                    if proc.returncode != 0:
+                        msg = stderr_text or f"agy завершился с кодом {proc.returncode}"
+                        yield sse_event({"type": "error", "message": msg})
+                    else:
+                        yield sse_event({"type": "done"})
+            except asyncio.CancelledError:
+                await session_mgr.cancel_active()
+                yield sse_event({"type": "done", "cancelled": True})
+            except Exception as exc:
+                logger.exception("agy CLI execution error")
+                yield sse_event({"type": "error", "message": str(exc)})
+            finally:
+                session_mgr.active_proc = None
 
     return StreamingResponse(
         event_generator(),
