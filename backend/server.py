@@ -19,10 +19,15 @@ from pydantic import BaseModel
 import google.antigravity as ag
 from google.antigravity import (
     Agent,
+    AgentBehavior,
     BuiltinTools,
     CapabilitiesConfig,
     CustomSystemInstructions,
+    GeminiAPIEndpoint,
+    GeminiModelOptions,
     LocalAgentConfig,
+    ModelTarget,
+    ThinkingLevel,
 )
 from google.antigravity.hooks import policy
 
@@ -273,13 +278,21 @@ class AgentSessionManager:
                         return True
             return False
 
+        chosen_model = model or DEFAULT_MODEL
+        model_target = ModelTarget(
+            name=chosen_model,
+            endpoint=GeminiAPIEndpoint(
+                api_key=api_key,
+                options=GeminiModelOptions(thinking_level=ThinkingLevel.LOW),
+            ),
+        )
         cfg = LocalAgentConfig(
-            api_key=api_key,
-            model=model or DEFAULT_MODEL,
+            models=[model_target],
             workspaces=[str(vault_root)],
             system_instructions=build_system_instructions(str(vault_root)),
             tools=make_vault_tools(vault_root),
             capabilities=CapabilitiesConfig(
+                agent_behavior=AgentBehavior.MINIMAL,
                 enable_subagents=False,
                 disabled_tools=[
                     BuiltinTools.RUN_COMMAND,
