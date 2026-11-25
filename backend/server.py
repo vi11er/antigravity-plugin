@@ -38,18 +38,16 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "local_settings.json"
 USAGE_PATH = BASE_DIR / "usage_stats.json"
 DEFAULT_VAULT = ""
-DEFAULT_MODEL = "gemini-4-hydrogen"
+DEFAULT_MODEL = "gemini-3.6-flash"
 DEFAULT_CONTEXT_LIMIT = 1_048_576
+FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite")
 
 ANTIGRAVITY_MODELS: list[dict[str, str]] = [
-    {"id": "gemini-4-hydrogen", "label": "Gemini 4 Hydrogen (Antigravity SDK default)"},
-    {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash"},
+    {"id": "gemini-3.6-flash", "label": "Gemini 3.6 Flash (Быстрая, высокий лимит)"},
+    {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash (Стабильная, высокий лимит)"},
     {"id": "gemini-3.5-flash-lite", "label": "Gemini 3.5 Flash-Lite"},
-    {"id": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro (Preview)"},
-    {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash (Preview)"},
-    {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
-    {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
-    {"id": "gemini-2.5-flash-lite", "label": "Gemini 2.5 Flash-Lite"},
+    {"id": "gemini-4-hydrogen", "label": "Gemini 4 Hydrogen (Лимит Free Tier: 20 зап/день)"},
+    {"id": "gemini-3.1-flash-lite", "label": "Gemini 3.1 Flash-Lite"},
 ]
 
 
@@ -287,7 +285,8 @@ class AgentSessionManager:
             ),
         )
         cfg = LocalAgentConfig(
-            models=[model_target],
+            api_key=api_key,
+            model=model_target,
             workspaces=[str(vault_root)],
             system_instructions=build_system_instructions(str(vault_root)),
             tools=make_vault_tools(vault_root),
@@ -300,6 +299,7 @@ class AgentSessionManager:
                     BuiltinTools.INVOKE_SUBAGENT,
                     BuiltinTools.RUN_WORKFLOW,
                     BuiltinTools.SCHEDULE,
+                    BuiltinTools.GENERATE_IMAGE,
                 ],
             ),
             policies=[
@@ -391,6 +391,14 @@ async def update_config(payload: ConfigPayload) -> dict[str, Any]:
 async def reset_session() -> dict[str, Any]:
     await session_mgr.stop()
     return {"status": "reset", "usage": session_mgr.get_usage_summary()}
+
+
+@app.post("/shutdown")
+async def shutdown_server() -> dict[str, str]:
+    await session_mgr.stop()
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.15, lambda: os._exit(0))
+    return {"status": "shutting_down"}
 
 
 def _fetch_live_gemini_models(api_key: str) -> list[dict[str, str]]:
@@ -510,38 +518,71 @@ async def chat_stream(payload: ChatPayload) -> StreamingResponse:
             return
 
         async with session_mgr._lock:
-            try:
-                agent = await session_mgr.ensure_agent(vault_path, model, api_key)
-                full_prompt = format_prompt_with_context(payload)
-                response = await agent.chat(full_prompt)
-                session_mgr.active_response = response
+            full_prompt = format_prompt_with_context(payload)
+            candidate_models = [model] + [m for m in FALLBACK_MODELS if m != model]
+            last_error: Exception | None = None
 
-                async for chunk in response.chunks:
-                    if isinstance(chunk, ag.types.Thought):
-                        if chunk.text:
-                            yield sse_event({"type": "thought", "text": chunk.text})
-                    elif isinstance(chunk, ag.types.ToolCall):
+            for attempt_idx, try_model in enumerate(candidate_models):
+                try:
+                    agent = await session_mgr.ensure_agent(vault_path, try_model, api_key)
+                    if attempt_idx > 0:
+                        cfg["model"] = try_model
+                        save_local_settings(cfg)
                         yield sse_event(
                             {
                                 "type": "tool_call",
-                                "name": chunk.name,
-                                "args": chunk.args if isinstance(chunk.args, dict) else str(chunk.args),
+                                "name": f"Автопереключение на {try_model} (лимит/ошибка {model})",
+                                "args": {},
                             }
                         )
-                    elif isinstance(chunk, ag.types.Text):
-                        if chunk.text:
-                            yield sse_event({"type": "token", "text": chunk.text})
 
-                usage_summary = session_mgr.add_turn_usage(getattr(response, "usage_metadata", None))
-                yield sse_event({"type": "usage", "usage": usage_summary})
-                yield sse_event({"type": "done"})
-            except asyncio.CancelledError:
-                yield sse_event({"type": "done", "cancelled": True})
-            except Exception as exc:
-                logger.exception("Chat error")
-                yield sse_event({"type": "error", "message": str(exc)})
-            finally:
-                session_mgr.active_response = None
+                    response = await agent.chat(full_prompt)
+                    session_mgr.active_response = response
+
+                    async for chunk in response.chunks:
+                        if isinstance(chunk, ag.types.Thought):
+                            if chunk.text:
+                                yield sse_event({"type": "thought", "text": chunk.text})
+                        elif isinstance(chunk, ag.types.ToolCall):
+                            yield sse_event(
+                                {
+                                    "type": "tool_call",
+                                    "name": chunk.name,
+                                    "args": chunk.args if isinstance(chunk.args, dict) else str(chunk.args),
+                                }
+                            )
+                        elif isinstance(chunk, ag.types.Text):
+                            if chunk.text:
+                                yield sse_event({"type": "token", "text": chunk.text})
+
+                    usage_summary = session_mgr.add_turn_usage(getattr(response, "usage_metadata", None))
+                    yield sse_event({"type": "usage", "usage": usage_summary})
+                    yield sse_event({"type": "done"})
+                    last_error = None
+                    break
+                except asyncio.CancelledError:
+                    await session_mgr.stop()
+                    yield sse_event({"type": "done", "cancelled": True})
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    err_str = str(exc)
+                    logger.warning("Attempt with model=%s failed: %s", try_model, err_str)
+                    # Always tear down broken/closed Agent session so next request never hangs
+                    await session_mgr.stop()
+                    # Retry with fallback model on WebSocket 1000 close, 429 quota, 404 or 503
+                    if any(
+                        marker in err_str
+                        for marker in ("1000 (OK)", "ConnectionClosed", "429", "RESOURCE_EXHAUSTED", "404", "NOT_FOUND", "503", "UNAVAILABLE")
+                    ):
+                        continue
+                    break
+                finally:
+                    session_mgr.active_response = None
+
+            if last_error is not None:
+                yield sse_event({"type": "error", "message": str(last_error)})
 
     return StreamingResponse(
         event_generator(),

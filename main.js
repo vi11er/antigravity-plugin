@@ -28,14 +28,11 @@ const MONTHS_SHORT_RU = [
 const DAYS_SHORT_RU = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
 
 const DEFAULT_MODELS = [
-  { id: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (по умолчанию в SDK)' },
-  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
+  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash (Быстрая, высокий лимит)' },
+  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash (Стабильная, высокий лимит)' },
   { id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash-Lite' },
-  { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro (Preview)' },
-  { id: 'gemini-3-flash-preview', label: 'Gemini 3 Flash (Preview)' },
-  { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
-  { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
-  { id: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash-Lite' },
+  { id: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen (Free Tier: 20 зап/день)' },
+  { id: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite' },
 ];
 
 function detectDefaultUvPath() {
@@ -49,7 +46,7 @@ const DEFAULT_SETTINGS = {
   uvPath: detectDefaultUvPath(),
   backendDir: path.join(os.homedir(), '.gemini', 'antigravity', 'scratch', 'obsidian-antigravity', 'backend'),
   apiKey: '',
-  model: 'gemini-4-hydrogen',
+  model: 'gemini-3.6-flash',
   autoStartBackend: true,
   excludeFreshCreateFromModified: true,
   includeActiveNote: true,
@@ -995,6 +992,12 @@ module.exports = class ObsidianAntigravityPlugin extends Plugin {
 
   async ensureBackendRunning(forceRestart) {
     if (forceRestart) {
+      try {
+        await fetch(`http://127.0.0.1:${this.settings.port}/shutdown`, { method: 'POST' });
+        await new Promise((r) => setTimeout(r, 400));
+      } catch {
+        // ignore if already stopped
+      }
       this.stopBackendProcess();
     } else {
       try {
